@@ -22,9 +22,11 @@
 
 #include "config.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <sys/wait.h>
 #include <glib/gi18n.h>
 #include <gdk/gdkx.h>
@@ -63,6 +65,7 @@
 
 #define CSD_POWER_SETTINGS_SCHEMA               "org.cinnamon.settings-daemon.plugins.power"
 #define CSD_XRANDR_SETTINGS_SCHEMA              "org.cinnamon.settings-daemon.plugins.xrandr"
+#define CSD_SAVER_SETTINGS_SCHEMA               "org.cinnamon.desktop.screensaver"
 #define CSD_SESSION_SETTINGS_SCHEMA             "org.cinnamon.desktop.session"
 #define CSD_CINNAMON_SESSION_SCHEMA             "org.cinnamon.SessionManager"
 
@@ -94,6 +97,7 @@
 enum {
         CSD_POWER_IDLETIME_NULL_ID,
         CSD_POWER_IDLETIME_DIM_ID,
+        CSD_POWER_IDLETIME_LOCK_ID,
         CSD_POWER_IDLETIME_BLANK_ID,
         CSD_POWER_IDLETIME_SLEEP_ID
 };
@@ -138,7 +142,6 @@ struct CsdPowerManagerPrivate
         GSettings               *settings_xrandr;
         GSettings               *settings_desktop_session;
         GSettings               *settings_cinnamon_session;
-        gboolean                use_logind;
         UpClient                *up_client;
         GDBusConnection         *connection;
         GCancellable            *bus_cancellable;
@@ -177,6 +180,7 @@ struct CsdPowerManagerPrivate
         GtkStatusIcon           *status_icon;
         guint                    xscreensaver_watchdog_timer_id;
         gboolean                 is_virtual_machine;
+        gint                     fd_close_loop_end;
 
         /* logind stuff */
         GDBusProxy              *logind_proxy;
@@ -198,13 +202,19 @@ static UpDevice *engine_get_composite_device (CsdPowerManager *manager, UpDevice
 static UpDevice *engine_update_composite_device (CsdPowerManager *manager, UpDevice *original_device);
 static GIcon    *engine_get_icon (CsdPowerManager *manager);
 static gchar    *engine_get_summary (CsdPowerManager *manager);
+static UpDevice *engine_get_primary_device (CsdPowerManager *manager);
+static void      engine_charge_low (CsdPowerManager *manager, UpDevice *device);
+static void      engine_charge_critical (CsdPowerManager *manager, UpDevice *device);
+static void      engine_charge_action (CsdPowerManager *manager, UpDevice *device);
 
 static gboolean  external_monitor_is_connected (GnomeRRScreen *screen);
 static void      do_power_action_type (CsdPowerManager *manager, CsdPowerActionType action_type);
 static void      do_lid_closed_action (CsdPowerManager *manager);
 static void      inhibit_lid_switch (CsdPowerManager *manager);
 static void      uninhibit_lid_switch (CsdPowerManager *manager);
-static void      lock_screensaver (CsdPowerManager *manager);
+static void      setup_locker_process (gpointer user_data);
+static void      lock_screen_with_custom_saver (CsdPowerManager *manager, gchar *custom_saver, gboolean idle_lock);
+static void      activate_screensaver (CsdPowerManager *manager, gboolean force_lock);
 static void      kill_lid_close_safety_timer (CsdPowerManager *manager);
 
 int             backlight_get_output_id (CsdPowerManager *manager);
@@ -224,6 +234,19 @@ csd_power_manager_error_quark (void)
         if (!quark)
                 quark = g_quark_from_static_string ("csd_power_manager_error");
         return quark;
+}
+
+static gboolean
+system_on_battery (CsdPowerManager *manager)
+{
+    UpDevice *primary;
+    UpDeviceState state;
+
+    // this will only return a device if it's the battery, it's present,
+    // and discharging.
+    primary = engine_get_primary_device (manager);
+
+    return primary != NULL;
 }
 
 static gboolean
@@ -361,6 +384,8 @@ engine_emit_changed (CsdPowerManager *manager,
         if (manager->priv->power_iface == NULL)
                 return;
 
+        gboolean need_flush = FALSE;
+
         if (icon_changed) {
                 GIcon *gicon;
                 gchar *gicon_str;
@@ -369,6 +394,7 @@ engine_emit_changed (CsdPowerManager *manager,
                 gicon_str = g_icon_to_string (gicon);
 
                 csd_power_set_icon (manager->priv->power_iface, gicon_str);
+                need_flush = TRUE;
 
                 g_free (gicon_str);
                 g_object_unref (gicon);
@@ -380,8 +406,13 @@ engine_emit_changed (CsdPowerManager *manager,
                 tooltip = engine_get_summary (manager);
 
                 csd_power_set_tooltip (manager->priv->power_iface, tooltip);
+                need_flush = TRUE;
 
                 g_free (tooltip);
+        }
+
+        if (need_flush) {
+                g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (manager->priv->power_iface));
         }
 }
 
@@ -918,12 +949,30 @@ engine_device_add (CsdPowerManager *manager, UpDevice *device)
                            "engine-state-old",
                            GUINT_TO_POINTER(state));
 
+#if UP_CHECK_VERSION(0,99,0)
+        g_ptr_array_add (manager->priv->devices_array, g_object_ref(device));
+
+        g_signal_connect (device, "notify",
+                          G_CALLBACK (device_properties_changed_cb), manager);
+#endif
+
         if (kind == UP_DEVICE_KIND_BATTERY) {
                 g_debug ("updating because we added a device");
                 composite = engine_update_composite_device (manager, device);
 
                 /* get the same values for the composite device */
                 warning = engine_get_warning (manager, composite);
+
+                if (warning == WARNING_LOW) {
+                        g_debug ("** EMIT: charge-low");
+                        engine_charge_low (manager, device);
+                } else if (warning == WARNING_CRITICAL) {
+                        g_debug ("** EMIT: charge-critical");
+                        engine_charge_critical (manager, device);
+                } else if (warning == WARNING_ACTION) {
+                        g_debug ("charge-action");
+                        engine_charge_action (manager, device);
+                }
                 g_object_set_data (G_OBJECT(composite),
                                    "engine-warning-old",
                                    GUINT_TO_POINTER(warning));
@@ -932,14 +981,6 @@ engine_device_add (CsdPowerManager *manager, UpDevice *device)
                                    "engine-state-old",
                                    GUINT_TO_POINTER(state));
         }
-
-#if UP_CHECK_VERSION(0,99,0)
-        g_ptr_array_add (manager->priv->devices_array, g_object_ref(device));
-
-        g_signal_connect (device, "notify",
-                          G_CALLBACK (device_properties_changed_cb), manager);
-#endif
-
 }
 
 static gboolean
@@ -1214,7 +1255,7 @@ engine_charge_low (CsdPowerManager *manager, UpDevice *device)
 
         /* check to see if the batteries have not noticed we are on AC */
         if (kind == UP_DEVICE_KIND_BATTERY) {
-                if (!up_client_get_on_battery (manager->priv->up_client)) {
+                if (!system_on_battery (manager)) {
                         g_warning ("ignoring low message as we are not on battery power");
                         goto out;
                 }
@@ -1255,14 +1296,14 @@ engine_charge_low (CsdPowerManager *manager, UpDevice *device)
                 title = _("Mouse battery low");
 
                 /* TRANSLATORS: tell user more details */
-                message = g_strdup_printf (_("Wireless mouse is low in power (%.0f%%)"), percentage);
+                message = g_strdup_printf (_("Wireless mouse is low in power"));
 
         } else if (kind == UP_DEVICE_KIND_KEYBOARD) {
                 /* TRANSLATORS: keyboard is getting a little low */
                 title = _("Keyboard battery low");
 
                 /* TRANSLATORS: tell user more details */
-                message = g_strdup_printf (_("Wireless keyboard is low in power (%.0f%%)"), percentage);
+                message = g_strdup_printf (_("Wireless keyboard is low in power"));
 
         } else if (kind == UP_DEVICE_KIND_PDA) {
                 /* TRANSLATORS: PDA is getting a little low */
@@ -1361,7 +1402,7 @@ engine_charge_critical (CsdPowerManager *manager, UpDevice *device)
 
         /* check to see if the batteries have not noticed we are on AC */
         if (kind == UP_DEVICE_KIND_BATTERY) {
-                if (!up_client_get_on_battery (manager->priv->up_client)) {
+                if (!system_on_battery (manager)) {
                         g_warning ("ignoring critically low message as we are not on battery power");
                         goto out;
                 }
@@ -1420,17 +1461,15 @@ engine_charge_critical (CsdPowerManager *manager, UpDevice *device)
                 title = _("Mouse battery low");
 
                 /* TRANSLATORS: the device is just going to stop working */
-                message = g_strdup_printf (_("Wireless mouse is very low in power (%.0f%%). "
-                                             "This device will soon stop functioning if not charged."),
-                                           percentage);
+                message = g_strdup_printf (_("Wireless mouse is very low in power. "
+                                             "This device will soon stop functioning if not charged."));
         } else if (kind == UP_DEVICE_KIND_KEYBOARD) {
                 /* TRANSLATORS: the keyboard battery is very low */
                 title = _("Keyboard battery low");
 
                 /* TRANSLATORS: the device is just going to stop working */
-                message = g_strdup_printf (_("Wireless keyboard is very low in power (%.0f%%). "
-                                             "This device will soon stop functioning if not charged."),
-                                           percentage);
+                message = g_strdup_printf (_("Wireless keyboard is very low in power. "
+                                             "This device will soon stop functioning if not charged."));
         } else if (kind == UP_DEVICE_KIND_PDA) {
 
                 /* TRANSLATORS: the PDA battery is very low */
@@ -1550,7 +1589,7 @@ engine_charge_action (CsdPowerManager *manager, UpDevice *device)
 
         /* check to see if the batteries have not noticed we are on AC */
         if (kind == UP_DEVICE_KIND_BATTERY) {
-                if (!up_client_get_on_battery (manager->priv->up_client)) {
+                if (!system_on_battery (manager)) {
                         g_warning ("ignoring critically low message as we are not on battery power");
                         goto out;
                 }
@@ -1929,36 +1968,39 @@ do_power_action_type (CsdPowerManager *manager,
         switch (action_type) {
         case CSD_POWER_ACTION_SUSPEND:
                 if (should_lock_on_suspend (manager)) {
-                        lock_screensaver (manager);
+                        activate_screensaver (manager, TRUE);
                 }
 
                 turn_monitors_off (manager);
 
                 gboolean hybrid = g_settings_get_boolean (manager->priv->settings_cinnamon_session,
                                                           "prefer-hybrid-sleep");
-                csd_power_suspend (manager->priv->use_logind, hybrid);
+                gboolean suspend_then_hibernate = g_settings_get_boolean (manager->priv->settings_cinnamon_session,
+                                                          "suspend-then-hibernate");
+
+                csd_power_suspend (hybrid, suspend_then_hibernate);
                 break;
         case CSD_POWER_ACTION_INTERACTIVE:
                 cinnamon_session_shutdown ();
                 break;
         case CSD_POWER_ACTION_HIBERNATE:
                 if (should_lock_on_suspend (manager)) {
-                        lock_screensaver (manager);
+                        activate_screensaver (manager, TRUE);
                 }
 
                 turn_monitors_off (manager);
-                csd_power_hibernate (manager->priv->use_logind);
+                csd_power_hibernate ();
                 break;
         case CSD_POWER_ACTION_SHUTDOWN:
                 /* this is only used on critically low battery where
                  * hibernate is not available and is marginally better
                  * than just powering down the computer mid-write */
-                csd_power_poweroff (manager->priv->use_logind);
+                csd_power_poweroff ();
                 break;
         case CSD_POWER_ACTION_BLANK:
                 /* Lock first or else xrandr might reconfigure stuff and the ss's coverage
                  * may be incorrect upon return. */
-                lock_screensaver (manager);
+                activate_screensaver (manager, FALSE);
                 turn_monitors_off (manager);
                 break;
         case CSD_POWER_ACTION_NOTHING:
@@ -2304,7 +2346,7 @@ suspend_with_lid_closed (CsdPowerManager *manager)
         CsdPowerActionType action_type;
 
         /* we have different settings depending on AC state */
-        if (up_client_get_on_battery (manager->priv->up_client)) {
+        if (system_on_battery (manager)) {
                 action_type = g_settings_get_enum (manager->priv->settings,
                                                    "lid-close-battery-action");
         } else {
@@ -2373,7 +2415,7 @@ up_client_changed_cb (UpClient *client, CsdPowerManager *manager)
         gboolean lid_is_closed;
         gboolean on_battery;
         
-        on_battery = up_client_get_on_battery(client);
+        on_battery = system_on_battery(manager);
         if (!on_battery) {
             /* if we are playing a critical charge sound loop on AC, stop it */
             if (manager->priv->critical_alert_timeout_id > 0) {
@@ -3106,7 +3148,7 @@ idle_set_mode (CsdPowerManager *manager, CsdPowerIdleMode mode)
         if (mode == CSD_POWER_IDLE_MODE_DIM) {
 
                 /* have we disabled the action */
-                if (up_client_get_on_battery (manager->priv->up_client)) {
+                if (system_on_battery (manager)) {
                         ret = g_settings_get_boolean (manager->priv->settings,
                                                       "idle-dim-battery");
                 } else {
@@ -3164,7 +3206,7 @@ idle_set_mode (CsdPowerManager *manager, CsdPowerIdleMode mode)
         /* sleep */
         } else if (mode == CSD_POWER_IDLE_MODE_SLEEP) {
 
-                if (up_client_get_on_battery (manager->priv->up_client)) {
+                if (system_on_battery (manager)) {
                         action_type = g_settings_get_enum (manager->priv->settings,
                                                            "sleep-inactive-battery-type");
                 } else {
@@ -3359,6 +3401,7 @@ idle_configure (CsdPowerManager *manager)
 {
         gboolean is_idle_inhibited;
         guint current_idle_time;
+        guint timeout_lock;
         guint timeout_blank;
         guint timeout_sleep;
         gboolean on_battery;
@@ -3370,6 +3413,8 @@ idle_configure (CsdPowerManager *manager)
                 g_debug ("inhibited, so using normal state");
                 idle_set_mode (manager, CSD_POWER_IDLE_MODE_NORMAL);
 
+                gpm_idletime_alarm_remove (manager->priv->idletime,
+                                           CSD_POWER_IDLETIME_LOCK_ID);
                 gpm_idletime_alarm_remove (manager->priv->idletime,
                                            CSD_POWER_IDLETIME_BLANK_ID);
                 gpm_idletime_alarm_remove (manager->priv->idletime,
@@ -3383,7 +3428,7 @@ idle_configure (CsdPowerManager *manager)
 
         /* set up blank callback even when session is not idle,
          * but only if we actually want to blank. */
-        on_battery = up_client_get_on_battery (manager->priv->up_client);
+        on_battery = system_on_battery (manager);
         if (on_battery) {
                 timeout_blank = g_settings_get_int (manager->priv->settings,
                                                     "sleep-display-battery");
@@ -3391,6 +3436,25 @@ idle_configure (CsdPowerManager *manager)
                 timeout_blank = g_settings_get_int (manager->priv->settings,
                                                     "sleep-display-ac");
         }
+
+        /* set up custom screensaver lock after idle time trigger */
+        timeout_lock = g_settings_get_uint (manager->priv->settings_desktop_session,
+                                            "idle-delay");
+        if (timeout_lock != 0) {
+                if (timeout_blank != 0 && timeout_lock > timeout_blank) {
+                        g_debug ("reducing lock timeout to match blank timeout");
+                        timeout_lock = timeout_blank;
+                }
+                g_debug ("setting up lock callback for %is", timeout_lock);
+
+                gpm_idletime_alarm_set (manager->priv->idletime,
+                                        CSD_POWER_IDLETIME_LOCK_ID,
+                                        idle_adjust_timeout (current_idle_time, timeout_lock) * 1000);
+        } else {
+                gpm_idletime_alarm_remove (manager->priv->idletime,
+                                           CSD_POWER_IDLETIME_LOCK_ID);
+        }
+
         if (timeout_blank != 0) {
                 g_debug ("setting up blank callback for %is", timeout_blank);
 
@@ -3449,21 +3513,129 @@ csd_power_manager_class_init (CsdPowerManagerClass *klass)
 }
 
 static void
-lock_screensaver (CsdPowerManager *manager)
+setup_locker_process (gpointer user_data)
+{
+        /* This function should only contain signal safe code, as it is invoked
+         * between fork and exec. See signal-safety(7) for more information. */
+        CsdPowerManager *manager = user_data;
+
+        /* close all FDs except stdin, stdout, stderr and the inhibition fd */
+        for (gint fd = 3; fd < manager->priv->fd_close_loop_end; fd++)
+                if (fd != manager->priv->inhibit_suspend_fd)
+                        close (fd);
+
+        /* make sure the inhibit fd does not get closed on exec, as it's options
+         * are not specified in the logind inhibitor interface documentation. */
+        if (-1 != manager->priv->inhibit_suspend_fd)
+                fcntl (manager->priv->inhibit_suspend_fd,
+                       F_SETFD,
+                       ~FD_CLOEXEC & fcntl (manager->priv->inhibit_suspend_fd, F_GETFD));
+}
+
+static void
+lock_screen_with_custom_saver (CsdPowerManager *manager,
+                               gchar *custom_saver,
+                               gboolean idle_lock)
+{
+        gboolean res;
+        gchar *fd = NULL;
+        gchar **argv = NULL;
+        gchar **env = NULL;
+        GError *error = NULL;
+
+        /* environment setup */
+        fd = g_strdup_printf ("%d", manager->priv->inhibit_suspend_fd);
+        if (!fd) {
+                g_warning ("failed to printf inhibit_suspend_fd");
+                goto quit;
+        }
+        if (!(env = g_get_environ ())) {
+                g_warning ("failed to get environment");
+                goto quit;
+        }
+        env = g_environ_setenv (env, "XSS_SLEEP_LOCK_FD", fd, FALSE);
+        if (!env) {
+                g_warning ("failed to set XSS_SLEEP_LOCK_FD");
+                goto quit;
+        }
+        env = g_environ_setenv (env,
+                                "LOCKED_BY_SESSION_IDLE",
+                                idle_lock ? "true" : "false",
+                                TRUE);
+        if (!env) {
+                g_warning ("failed to set LOCKED_BY_SESSION_IDLE");
+                goto quit;
+        }
+
+        /* argv setup */
+        res = g_shell_parse_argv (custom_saver, NULL, &argv, &error);
+        if (!res) {
+                g_warning ("failed to parse custom saver cmd '%s': %s",
+                           custom_saver,
+                           error->message);
+                goto quit;
+        }
+
+        /* get the max number of open file descriptors */
+        manager->priv->fd_close_loop_end = sysconf (_SC_OPEN_MAX);
+        if (-1 == manager->priv->fd_close_loop_end)
+                /* use some sane default */
+                manager->priv->fd_close_loop_end = 32768;
+
+        /* spawn the custom screen locker */
+        res = g_spawn_async (NULL,
+                             argv,
+                             env,
+                             G_SPAWN_LEAVE_DESCRIPTORS_OPEN | G_SPAWN_SEARCH_PATH,
+                             &setup_locker_process,
+                             manager,
+                             NULL,
+                             &error);
+        if (!res)
+                g_warning ("failed to run custom screensaver '%s': %s",
+                           custom_saver,
+                           error->message);
+
+quit:
+        g_free (fd);
+        g_strfreev (argv);
+        g_strfreev (env);
+        g_clear_error (&error);
+}
+
+static void
+activate_screensaver (CsdPowerManager *manager, gboolean force_lock)
 {
     GError *error;
     gboolean ret;
+    gchar *custom_saver = g_settings_get_string (manager->priv->settings_screensaver,
+                                                 "custom-screensaver-command");
 
     g_debug ("Locking screen before sleep/hibernate");
 
+    if (custom_saver && g_strcmp0 (custom_saver, "") != 0) {
+            lock_screen_with_custom_saver (manager, custom_saver, FALSE);
+            goto quit;
+    }
+
+    /* if we fail to get the gsettings entry, or if the user did not select
+     * a custom screen saver, default to invoking cinnamon-screensaver */
     /* do this sync to ensure it's on the screen when we start suspending */
     error = NULL;
-    ret = g_spawn_command_line_sync ("cinnamon-screensaver-command --lock", NULL, NULL, NULL, &error);
+
+    if (force_lock) {
+        ret = g_spawn_command_line_sync ("cinnamon-screensaver-command --lock", NULL, NULL, NULL, &error);
+    } else {
+        ret = g_spawn_command_line_sync ("cinnamon-screensaver-command -a", NULL, NULL, NULL, &error);
+    }
 
     if (!ret) {
         g_warning ("Couldn't lock screen: %s", error->message);
         g_error_free (error);
     }
+
+quit:
+    g_free (custom_saver);
 }
 
 static void
@@ -3615,6 +3787,22 @@ idle_idletime_alarm_expired_cb (GpmIdletime *idletime,
         switch (alarm_id) {
         case CSD_POWER_IDLETIME_DIM_ID:
                 idle_set_mode (manager, CSD_POWER_IDLE_MODE_DIM);
+                break;
+        case CSD_POWER_IDLETIME_LOCK_ID:
+                ; /* empty statement, because C does not allow a declaration to
+                   * follow a label */
+                gchar *custom_saver = g_settings_get_string (manager->priv->settings_screensaver,
+                                                             "custom-screensaver-command");
+                if (custom_saver && g_strcmp0 (custom_saver, "") != 0) {
+                        lock_screen_with_custom_saver (manager,
+                                                       custom_saver,
+                                                       TRUE);
+                } else {
+                    activate_screensaver (manager, FALSE);
+                }
+
+                g_free (custom_saver);
+
                 break;
         case CSD_POWER_IDLETIME_BLANK_ID:
                 idle_set_mode (manager, CSD_POWER_IDLE_MODE_BLANK);
@@ -3902,7 +4090,7 @@ handle_suspend_actions (CsdPowerManager *manager)
          * suppose.)
          */
         if (should_lock_on_suspend (manager)) {
-            lock_screensaver (manager);
+            activate_screensaver (manager, TRUE);
         }
 
         /* lift the delay inhibit, so logind can proceed */
@@ -4077,11 +4265,10 @@ csd_power_manager_start (CsdPowerManager *manager,
         manager->priv->settings = g_settings_new (CSD_POWER_SETTINGS_SCHEMA);
         g_signal_connect (manager->priv->settings, "changed",
                           G_CALLBACK (engine_settings_key_changed_cb), manager);
-        manager->priv->settings_screensaver = g_settings_new ("org.cinnamon.desktop.screensaver");
+        manager->priv->settings_screensaver = g_settings_new (CSD_SAVER_SETTINGS_SCHEMA);
         manager->priv->settings_xrandr = g_settings_new (CSD_XRANDR_SETTINGS_SCHEMA);
         manager->priv->settings_desktop_session = g_settings_new (CSD_SESSION_SETTINGS_SCHEMA);
         manager->priv->settings_cinnamon_session = g_settings_new (CSD_CINNAMON_SESSION_SCHEMA);
-        manager->priv->use_logind = g_settings_get_boolean (manager->priv->settings_desktop_session, "settings-daemon-uses-logind");
         manager->priv->inhibit_lid_switch_enabled =
                           g_settings_get_boolean (manager->priv->settings, "inhibit-lid-switch");
 
@@ -4414,6 +4601,10 @@ csd_power_manager_finalize (GObject *object)
         G_OBJECT_CLASS (csd_power_manager_parent_class)->finalize (object);
 }
 
+#if !UP_CHECK_VERSION(0,99,0)
+#define UP_DEVICE_LEVEL_NONE 1
+#endif
+
 static GVariant *
 device_to_variant_blob (UpDevice *device)
 {
@@ -4426,7 +4617,7 @@ device_to_variant_blob (UpDevice *device)
         GVariant *value;
         UpDeviceKind kind;
         UpDeviceState state;
-        UpDeviceLevel battery_level;
+        gint battery_level;
 
         icon = gpm_upower_get_device_icon (device, TRUE);
         device_icon = g_icon_to_string (icon);
@@ -4435,11 +4626,19 @@ device_to_variant_blob (UpDevice *device)
                       "model", &model,
                       "kind", &kind,
                       "percentage", &percentage,
-                      "battery-level", &battery_level,
                       "state", &state,
                       "time-to-empty", &time_empty,
                       "time-to-full", &time_full,
                       NULL);
+
+        /* upower < 0.99.5 compatibility */
+        if (g_object_class_find_property (G_OBJECT_GET_CLASS (device), "battery-level")) {
+                g_object_get (device,
+                              "battery-level", &battery_level,
+                              NULL);
+        } else {
+                battery_level = UP_DEVICE_LEVEL_NONE;
+        }
 
         /* only return time for these simple states */
         if (state == UP_DEVICE_STATE_DISCHARGING)

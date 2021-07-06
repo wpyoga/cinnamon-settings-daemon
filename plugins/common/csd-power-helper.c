@@ -32,6 +32,33 @@
 #define CONSOLEKIT_DBUS_PATH_MANAGER            "/org/freedesktop/ConsoleKit/Manager"
 #define CONSOLEKIT_DBUS_INTERFACE_MANAGER       "org.freedesktop.ConsoleKit.Manager"
 
+#ifdef HAVE_LOGIND
+
+static gboolean
+use_logind (void)
+{
+    static gboolean should_use_logind = FALSE;
+    static gsize once_init_value = 0;
+
+    if (g_once_init_enter (&once_init_value)) {
+        should_use_logind = access("/run/systemd/seats/", F_OK) == 0; // sd_booted ()
+
+        g_once_init_leave (&once_init_value, 1);
+    }
+
+    return should_use_logind;
+}
+
+#else /* HAVE_LOGIND */
+
+static gboolean
+use_logind (void)
+{
+    return FALSE;
+}
+
+#endif /* HAVE_LOGIND */
+
 static void
 logind_stop (void)
 {
@@ -48,9 +75,59 @@ logind_stop (void)
         g_object_unref (bus);
 }
 
-static void
-logind_suspend (void)
+static gboolean
+can_power_action (gchar *method_name)
 {
+        GDBusConnection *bus;
+        GVariant *res;
+        gchar *rv;
+        gboolean can_action;
+        GError *error = NULL;
+
+        bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
+        res = g_dbus_connection_call_sync (bus,
+                                           LOGIND_DBUS_NAME,
+                                           LOGIND_DBUS_PATH,
+                                           LOGIND_DBUS_INTERFACE,
+                                           method_name,
+                                           NULL,
+                                           G_VARIANT_TYPE_TUPLE,
+                                           0, G_MAXINT, NULL, &error);
+
+        g_object_unref (bus);
+
+        if (error) {
+          g_warning ("Calling %s failed: %s", method_name, error->message);
+          g_clear_error (&error);
+
+          return FALSE;
+        }
+
+        g_variant_get (res, "(s)", &rv);
+        g_variant_unref (res);
+
+        can_action = g_strcmp0 (rv, "yes") == 0 ||
+                     g_strcmp0 (rv, "challenge") == 0;
+
+        if (!can_action) {
+          g_warning ("logind does not support method %s", method_name);
+        }
+
+        g_free (rv);
+
+        return can_action;
+}
+
+static void
+logind_suspend (gboolean suspend_then_hibernate)
+{
+
+	gchar *method_name = "Suspend";
+
+	if (suspend_then_hibernate && can_power_action("CanHibernate")) {
+		method_name = "SuspendThenHibernate";		
+	}
+
         GDBusConnection *bus;
 
         bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
@@ -58,7 +135,7 @@ logind_suspend (void)
                                 LOGIND_DBUS_NAME,
                                 LOGIND_DBUS_PATH,
                                 LOGIND_DBUS_INTERFACE,
-                                "Suspend",
+                                method_name,
                                 g_variant_new ("(b)", TRUE),
                                 NULL, 0, G_MAXINT, NULL, NULL, NULL);
         g_object_unref (bus);
@@ -78,49 +155,6 @@ logind_hybrid_suspend (void)
                                 g_variant_new ("(b)", TRUE),
                                 NULL, 0, G_MAXINT, NULL, NULL, NULL);
         g_object_unref (bus);
-}
-
-static gboolean
-can_hybrid_sleep (void)
-{
-        GDBusConnection *bus;
-        GVariant *res;
-        gchar *rv;
-        gboolean can_hybrid;
-        GError *error = NULL;
-
-        bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
-        res = g_dbus_connection_call_sync (bus,
-                                           LOGIND_DBUS_NAME,
-                                           LOGIND_DBUS_PATH,
-                                           LOGIND_DBUS_INTERFACE,
-                                           "CanHybridSleep",
-                                           NULL,
-                                           G_VARIANT_TYPE_TUPLE,
-                                           0, G_MAXINT, NULL, &error);
-
-        g_object_unref (bus);
-
-        if (error) {
-          g_warning ("Calling CanHybridSleep failed: %s", error->message);
-          g_clear_error (&error);
-
-          return FALSE;
-        }
-
-        g_variant_get (res, "(s)", &rv);
-        g_variant_unref (res);
-
-        can_hybrid = g_strcmp0 (rv, "yes") == 0 ||
-                     g_strcmp0 (rv, "challenge") == 0;
-
-        if (!can_hybrid) {
-          g_warning ("logind does not support hybrid sleep");
-        }
-
-        g_free (rv);
-
-        return can_hybrid;
 }
 
 static void
@@ -209,10 +243,16 @@ consolekit_sleep_cb (GObject *source_object,
 }
 
 static void
-consolekit_suspend (void)
+consolekit_suspend (gboolean suspend_then_hibernate)
 {
         GError *error = NULL;
         GDBusProxy *proxy;
+
+	gchar *method_name = "Suspend";
+
+	if (suspend_then_hibernate && can_power_action("CanHibernate")) {
+		method_name = "SuspendThenHibernate";
+	}
         
         proxy = g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
                                                G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
@@ -228,7 +268,7 @@ consolekit_suspend (void)
                 return;
         }
         g_dbus_proxy_call (proxy,
-                           "Suspend",
+                           method_name,
                            g_variant_new("(b)", TRUE),
                            G_DBUS_CALL_FLAGS_NONE,
                            -1, NULL,
@@ -293,31 +333,30 @@ consolekit_hybrid_suspend (void)
 }
 
 void
-csd_power_suspend (gboolean    use_logind,
-                   gboolean    try_hybrid)
+csd_power_suspend (gboolean try_hybrid, gboolean suspend_then_hibernate)
 {
-  if (use_logind) {
-    if (try_hybrid && can_hybrid_sleep ()) {
+  if (use_logind ()) {
+    if (try_hybrid && can_power_action ("CanHybridSleep")) {
       logind_hybrid_suspend ();
     }
     else {
-      logind_suspend ();
+      logind_suspend (suspend_then_hibernate);
     }
   }
   else {
-    if (try_hybrid && can_hybrid_sleep ()) {
+    if (try_hybrid && can_power_action ("CanHybridSleep")) {
       consolekit_hybrid_suspend ();
     }
     else {
-      consolekit_suspend ();
+      consolekit_suspend (suspend_then_hibernate);
     }
   }
 }
 
 void
-csd_power_poweroff (gboolean use_logind)
+csd_power_poweroff (void)
 {
-  if (use_logind) {
+  if (use_logind ()) {
     logind_stop ();
   }
   else {
@@ -326,9 +365,9 @@ csd_power_poweroff (gboolean use_logind)
 }
 
 void
-csd_power_hibernate (gboolean use_logind)
+csd_power_hibernate (void)
 {
-  if (use_logind) {
+  if (use_logind ()) {
     logind_hibernate ();
   }
   else {

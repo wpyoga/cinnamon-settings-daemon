@@ -3,14 +3,12 @@ Section: x11
 Priority: optional
 Maintainer: Linux Mint <root@linuxmint.com>
 Build-Depends:
- autoconf-archive,
- automake,
- autotools-dev,
- debhelper (>= 10),
+ meson (>= 0.47),
+ debhelper-compat (= 12),
  docbook-xsl,
  intltool (>= 0.37.1),
  libcanberra-gtk3-dev,
- libcinnamon-desktop-dev (>= 3.4~),
+ libcinnamon-desktop-dev (>= 4.8.0),
  libcolord-dev (>= 0.1.27),
  libcups2-dev,
  libcvc-dev (>= 3.4~),
@@ -37,7 +35,6 @@ Build-Depends:
  xserver-xorg-input-wacom [!s390x !hurd-any !kfreebsd-any],
  xsltproc,
 Standards-Version: 3.9.8
-Homepage: http://cinnamon.linuxmint.com
 
 Package: cinnamon-settings-daemon
 Architecture: any
@@ -52,14 +49,6 @@ Suggests:
  tracker-gui | gnome-search-tool,
  x11-xserver-utils,
 Pre-Depends: ${misc:Pre-Depends}
-Breaks:
- banshee (<< 0.13.2+dfsg-7),
- gnome-color-manager (<< 3.0),
- gnome-screensaver (<< 2.28.0),
- gnome-session (<< 2.24),
- rhythmbox (<< 0.11.5),
- totem (<< 2.22.0),
- unity-greeter (<< 0.2.1-0ubuntu1),
 Description: daemon handling the Cinnamon session settings
  This package contains the daemon which is responsible for setting the
  various parameters of a Cinnamon session and the applications that run
